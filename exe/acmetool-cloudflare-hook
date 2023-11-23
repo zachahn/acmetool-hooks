@@ -1,0 +1,184 @@
+#!/usr/bin/env ruby
+
+require "json"
+require "net/http"
+require "resolv"
+
+module EnumerableBang
+  refine Enumerable do
+    def find!(&block)
+      find(-> { raise "Not found" }, &block)
+    end
+
+    def first!
+      first || raise("No entries")
+    end
+  end
+end
+
+using EnumerableBang
+
+class CloudflareClient
+  TIMEOUT = {
+    open_timeout: 5,
+    write_timeout: 1,
+    read_timeout: 30
+  }
+
+  class Response
+    def initialize(net_http_response)
+      @net_http_response = net_http_response
+    end
+
+    def code
+      Integer(raw.code)
+    end
+
+    def body
+      JSON.parse(raw.body)
+    end
+
+    def raw
+      @net_http_response
+    end
+  end
+
+  def initialize
+    @base = URI("https://api.cloudflare.com")
+    @headers = {
+      "Authorization" => "Bearer #{ENV.fetch("ACMETOOL_CLOUDFLARE_DNS_TOKEN")}",
+      "Content-Type" => "application/json"
+    }
+  end
+
+  def get(path, query_params = {})
+    path = URI(path).path
+    if query_params.size > 0
+      encoded_query_params = URI.encode_www_form(query_params)
+      path = path + "?" + encoded_query_params
+    end
+
+    request = Net::HTTP::Get.new(path)
+    invoke(request)
+  end
+
+  def post(path, body)
+    request = Net::HTTP::Post.new(path)
+    request.body = JSON.dump(body)
+    invoke(request)
+  end
+
+  def delete(path)
+    request = Net::HTTP::Delete.new(path)
+    invoke(request)
+  end
+
+  def get!(*args)
+    successful(get(*args))
+  end
+
+  def post!(*args)
+    successful(post(*args))
+  end
+
+  def delete!(*args)
+    successful(delete(*args))
+  end
+
+  private
+
+  def invoke(request)
+    @headers.each do |key, value|
+      request[key] = value
+    end
+
+    response = Net::HTTP.start(@base.hostname, use_ssl: @base.scheme == "https", **TIMEOUT) do |http|
+      http.request(request)
+    end
+
+    Response.new(response)
+  end
+
+  def successful(response)
+    return response if (200..299).cover?(response.code)
+    raise "Unsuccessful request with status code: #{response.code}"
+  end
+end
+
+class Main
+  ERROR_UNSUPPORTED_EVENT_TYPE = 42
+  CHALLENGE_DNS_START = "challenge-dns-start"
+  CHALLENGE_DNS_STOP = "challenge-dns-stop"
+  HANDLED_CHALLENGES = [CHALLENGE_DNS_START, CHALLENGE_DNS_STOP]
+
+  def self.run(argv)
+    new.run(argv)
+  end
+
+  def run(argv)
+    event_type = argv.fetch(0)
+    if !HANDLED_CHALLENGES.include?(event_type)
+      exit ERROR_UNSUPPORTED_EVENT_TYPE
+    end
+
+    hostname = argv.fetch(1)
+    value = argv.fetch(3)
+
+    cloudflare.get!("/client/v4/user/tokens/verify")
+
+    response = cloudflare.get!("/client/v4/zones", {per_page: 50})
+    matching_zone = response.body.fetch("result").find! { |r| r.fetch("name") == hostname }
+
+    case event_type
+    when CHALLENGE_DNS_START
+      response = cloudflare.get!("/client/v4/zones/#{matching_zone.fetch("id")}/dns_records")
+      response.body.fetch("result").each do |r|
+        if r.fetch("name") == "_acme-challenge.#{hostname}"
+          cloudflare.delete!("/client/v4/zones/#{matching_zone.fetch("id")}/dns_records/#{r.fetch("id")}")
+        end
+      end
+
+      request_body = {
+        content: value,
+        name: "_acme-challenge.#{hostname}",
+        type: "TXT",
+        comment: "acmetook-cloudflare-hook (ruby)"
+      }
+      cloudflare.post!("/client/v4/zones/#{matching_zone.fetch("id")}/dns_records", request_body)
+
+      ensure_txt_record_exists(matching_zone.fetch("name_servers"), "_acme-challenge.#{hostname}", value, timeout: 30)
+    when CHALLENGE_DNS_STOP
+      response = cloudflare.get!("/client/v4/zones/#{matching_zone.fetch("id")}/dns_records")
+      matching_dns_record = response.body.fetch("result").find! do |r|
+        r.fetch("name") == "_acme-challenge.#{hostname}"
+      end
+
+      cloudflare.delete!("/client/v4/zones/#{matching_zone.fetch("id")}/dns_records/#{matching_dns_record.fetch("id")}")
+    else
+      raise "Absurd hook"
+    end
+  end
+
+  def ensure_txt_record_exists(nameservers, name, expected, timeout:)
+    Resolv::DNS.open(nameserver: nameservers.first!) do |r|
+      r.timeouts = 1
+      timeout.times do
+        resources = r.getresources(name, Resolv::DNS::Resource::IN::TXT)
+        if resources.any? { |r| r.data == expected }
+          return true
+        end
+        sleep 1
+      end
+    end
+
+    raise "acme challenge does not appear to be set within timeout"
+  end
+
+  def cloudflare
+    @cloudflare ||= CloudflareClient.new
+  end
+end
+
+if __FILE__ == $0
+  Main.run(ARGV)
+end

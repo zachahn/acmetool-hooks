@@ -1,0 +1,89 @@
+#!/usr/bin/env ruby
+
+require "json"
+require "open3"
+require "pathname"
+require "rubygems/package"
+require "securerandom"
+require "stringio"
+
+class Dokku
+  def apps
+    return @apps if instance_variable_defined?(:@apps)
+
+    out, _err, status = Open3.capture3("dokku", "apps:report", "--format", "json")
+    exit 1 if !status.success?
+
+    @apps = out.each_line.each_with_object({}) do |line, apps|
+      parsed = JSON.parse(line)
+      apps[parsed.fetch("app-deploy-source")] = parsed
+    end
+  end
+
+  def each_app(pattern)
+    pattern = /\A#{pattern.sub("*", "[a-z0-9-]+").gsub(".", "\\.")}\z/i
+    apps.each do |name, app|
+      if name&.match?(pattern)
+        puts "==> Reloading #{name}"
+        yield app
+      end
+    end
+  end
+
+  def update_cert(app, cert_tar)
+    name = app.fetch("app-deploy-source")
+    Open3.capture3("dokku", "certs:update", name, stdin_data: cert_tar, binmode: true)
+  end
+end
+
+class Main
+  ERROR_UNSUPPORTED_EVENT_TYPE = 42
+
+  def self.run(env, argv, argf)
+    new.run(env, argv, argf)
+  end
+
+  def tar_contents(certdir)
+    contents = StringIO.new("".b)
+    Gem::Package::TarWriter.new(contents) do |tar|
+      tar.add_file("server.crt", 0o100600) do |destination|
+        certdir.join("fullchain").open do |source|
+          IO.copy_stream(source, destination)
+        end
+      end
+      tar.add_file("server.key", 0o100600) do |destination|
+        certdir.join("privkey").realpath.open do |source|
+          IO.copy_stream(source, destination)
+        end
+      end
+    end
+    contents
+  end
+
+  def run(env, argv, argf)
+    event_type = argv.shift
+    exit ERROR_UNSUPPORTED_EVENT_TYPE unless event_type == "live-updated"
+
+    dokku = Dokku.new
+    dokku.apps
+
+    acmetool_state_dir = ENV.fetch("ACME_STATE_DIR")
+    statedir = Pathname.new(acmetool_state_dir)
+    statedir.entries
+    livedir = statedir.join("live")
+    livedir.entries
+
+    argf.read.each_line do |domain|
+      domain = domain.chomp
+      dokku.each_app(domain) do |app|
+        certdir = livedir.join(domain)
+        contents = tar_contents(certdir)
+        dokku.update_cert(app, contents.string)
+      end
+    end
+  end
+end
+
+if __FILE__ == $0
+  Main.run(ENV, ARGV, ARGF)
+end
